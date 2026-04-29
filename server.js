@@ -1,4 +1,4 @@
-import express from "express";
+  import express from "express";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { jsonrepair } from "jsonrepair";
@@ -28,6 +28,13 @@ const MIME = {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const libreConvertAsync = promisify(libre.convert);
+const DEFAULT_HTTP_TIMEOUT_MS = Math.max(5000, Number(process.env.HTTP_TIMEOUT_MS || 180000));
+const MEDIA_HTTP_TIMEOUT_MS = Math.max(
+  DEFAULT_HTTP_TIMEOUT_MS,
+  Number(process.env.HTTP_MEDIA_TIMEOUT_MS || 45 * 60 * 1000)
+);
+const FILE_ACTIVE_TIMEOUT_MS = Math.max(600000, Number(process.env.FILE_ACTIVE_TIMEOUT_MS || 45 * 60 * 1000));
+const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
 
 const ext = (n) => {
   const i = String(n || "").lastIndexOf(".");
@@ -49,6 +56,35 @@ const fetchOpts = {
   redirect: "follow",
   headers: { "User-Agent": "CastingRenderService/1" },
 };
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-request") {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error(`${label} timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function readWithTimeout(promise, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-read") {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
 const cleanApiKey = (v) => {
@@ -132,15 +168,21 @@ const roleCharsText = (rc) => {
   }
 };
 
-async function fetchBinary(url) {
+async function fetchBinary(url, authToken = "") {
   const abs = normalizeUrl(url);
   console.log("Fetching:", abs);
   if (!abs) throw new Error("Missing file URL");
 
-  const res = await fetch(abs, fetchOpts);
+  const t0 = Date.now();
+  const opts = { ...fetchOpts };
+  if (authToken) {
+    opts.headers = { ...opts.headers, "Authorization": `Bearer ${authToken}` };
+  }
+  const res = await fetchWithTimeout(abs, opts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
   if (!res.ok) throw new Error(`Fetch ${res.status}: ${abs}`);
 
-  const ab = await res.arrayBuffer();
+  console.log(`[fetchBinary] response headers received url=${abs}`);
+  const ab = await readWithTimeout(res.arrayBuffer(), MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:body");
   let name = "file";
 
   try {
@@ -150,6 +192,8 @@ async function fetchBinary(url) {
   } catch {}
 
   const buffer = Buffer.from(ab);
+  const elapsed = Date.now() - t0;
+  console.log(`[fetchBinary] completed url=${abs} bytes=${buffer.length} elapsed_ms=${elapsed}`);
   return { buffer, name, size: buffer.length };
 }
 
@@ -175,7 +219,9 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
     meta = JSON.stringify({ file: { display_name: "upload.bin", mime_type: mimeType } });
   }
 
-  const startRes = await fetch(`${UP}?key=${encodeURIComponent(apiKey)}`, {
+  const startRes = await fetchWithTimeout(
+    `${UP}?key=${encodeURIComponent(apiKey)}`,
+    {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -185,15 +231,20 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
       "X-Goog-Upload-Header-Content-Type": mimeType,
     },
     body: meta,
-  });
+    },
+    DEFAULT_HTTP_TIMEOUT_MS,
+    "upload:start"
+  );
 
   const uploadUrl = startRes.headers.get("x-goog-upload-url") || startRes.headers.get("X-Goog-Upload-Url");
   if (!uploadUrl) {
-    const t = await startRes.text();
+    const t = await readWithTimeout(startRes.text(), DEFAULT_HTTP_TIMEOUT_MS, "upload:start-read");
     throw new Error(`Upload start ${startRes.status}: ${t.slice(0, 800)}`);
   }
 
-  const upRes = await fetch(uploadUrl.trim(), {
+  const upRes = await fetchWithTimeout(
+    uploadUrl.trim(),
+    {
     method: "POST",
     headers: {
       "X-Goog-Upload-Offset": "0",
@@ -201,9 +252,12 @@ async function upload(apiKey, fileBuffer, displayName, mimeType) {
       "Content-Type": mimeType,
     },
     body: mid,
-  });
+    },
+    MEDIA_HTTP_TIMEOUT_MS,
+    "upload:bytes"
+  );
 
-  const text = await upRes.text();
+  const text = await readWithTimeout(upRes.text(), MEDIA_HTTP_TIMEOUT_MS, "upload:bytes-read");
 
   let json;
   try {
@@ -269,9 +323,9 @@ async function waitActive(apiKey, fileName) {
   const url = `${FILES}/${encodeURIComponent(id)}?key=${encodeURIComponent(apiKey)}`;
   const t0 = Date.now();
 
-  while (Date.now() - t0 < 600000) {
-    const res = await fetch(url, fetchOpts);
-    const text = await res.text();
+  while (Date.now() - t0 < FILE_ACTIVE_TIMEOUT_MS) {
+    const res = await fetchWithTimeout(url, fetchOpts, DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status");
+    const text = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status-read");
 
     let json;
     try {
@@ -308,7 +362,7 @@ async function analyzeCasting(properties) {
   const resumeUrl = p.resume_url ? normalizeUrl(p.resume_url) : "";
   const headshotUrl = p.headshot_url ? normalizeUrl(p.headshot_url) : "";
 
-  const vf = await fetchBinary(videoUrl);
+  const vf = await fetchBinary(videoUrl, MEDIA_ACCESS_TOKEN);
   if (vf.size > LIM.v) throw new Error("Video too large");
 
   const parts = [];
@@ -322,7 +376,7 @@ async function analyzeCasting(properties) {
   let headshotProvided = false;
 
   if (resumeUrl) {
-    const rf = await fetchBinary(resumeUrl);
+    const rf = await fetchBinary(resumeUrl, MEDIA_ACCESS_TOKEN);
     if (rf.size > LIM.r) throw new Error("Resume too large");
     const resumeMime = guessMime(rf.name, "application/pdf");
     const normalizedResume = await convertOfficeToPdfIfNeeded(
@@ -342,7 +396,7 @@ async function analyzeCasting(properties) {
   }
 
   if (headshotUrl) {
-    const hf = await fetchBinary(headshotUrl);
+    const hf = await fetchBinary(headshotUrl, MEDIA_ACCESS_TOKEN);
     if (hf.size > LIM.h) throw new Error("Headshot too large");
     const hUp = await upload(apiKey, hf.buffer, hf.name || "headshot.jpg", guessMime(hf.name, "image/jpeg"));
     await waitActive(apiKey, hUp.name);
@@ -378,6 +432,7 @@ async function analyzeCasting(properties) {
     "- overall_assessment: concise but detailed summary of fit for the role.\n" +
     "- recommendation: clear next step (for example callback, request more material, or not a fit) with brief rationale.\n\n" +
     "If something cannot be judged from the footage (for example poor mic, face not visible, clip too short), state that limitation in considerations rather than inventing facts.\n\n" +
+    "- Location fit: Prefer candidates in or near the role location. If far away, consider whether relocation or remote work is realistic based on the project.\n" +
     "Project Title: " + s(p.PROJECT_TITLE) +
     "\nProject Overview: " + s(p.project_overview) +
     "\nCasting for: " + s(p.casting_for) +
@@ -388,18 +443,14 @@ async function analyzeCasting(properties) {
     "\nRole Requirements: " + s(p.role_requirements) +
     "\nRole Characteristics: " + roleCharsText(p.role_characteristics) +
     "\nAge Range: " + s(p.age_range) +
-    "\nCountry: " + s(p.country) +
-    "\nState: " + s(p.role_state) +
-    "\nCity: " + s(p.city) +
+    "\nLocation: " + s(p.location) + " (role)" +
     "\nMinimum Height: " + s(p.minimum_height) +
     "\nMaximum Height: " + s(p.maximum_height) +
     "\nMinimum AI Score: " + s(p.minimum_ai_score) +
     "\n\nAPPLICANT\n" +
     "Gender: " + s(p.user_gender) +
     "\nAge: " + s(p.user_age) +
-    "\nCity: " + s(p.user_city) +
-    "\nState: " + s(p.user_state) +
-    "\nCountry: " + s(p.user_country) +
+    "\nLocation: " + s(p.user_location) + " (applicant)" +
     "\nHeight: " + s(p.user_height) +
     "\nHeadshot URL (text field): " + (headshotText || "(not provided)") +
     "\nDrive Folder Link: " + (drive || "(not provided)") +
@@ -412,16 +463,21 @@ async function analyzeCasting(properties) {
 
   const callGenerateContent = async (modelName) => {
     const genUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const genRes = await fetch(genUrl, {
+    const genRes = await fetchWithTimeout(
+      genUrl,
+      {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ parts }],
         generationConfig: { responseMimeType: "application/json" },
       }),
-    });
+      },
+      DEFAULT_HTTP_TIMEOUT_MS,
+      `generateContent:${modelName}`
+    );
 
-    const genText = await genRes.text();
+    const genText = await readWithTimeout(genRes.text(), DEFAULT_HTTP_TIMEOUT_MS, `generateContent:${modelName}:read`);
     console.log(`[gemini] model=${modelName} status=${genRes.status}`);
     if (!genRes.ok) {
       console.error(`[gemini] non-ok response body snippet: ${genText.slice(0, 1000)}`);
@@ -530,18 +586,23 @@ async function sendBubbleCallback(payload, callbackUrl) {
     for (const url of callbackCandidates) {
       try {
         console.log(`[callback] attempt=${attempt}/${maxAttempts} url=${url}`);
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(
+          url,
+          {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
-        });
+          },
+          DEFAULT_HTTP_TIMEOUT_MS,
+          "bubble-callback"
+        );
 
         if (res.ok) {
           console.log(`[callback] success status=${res.status} url=${url}`);
           return;
         }
 
-        const t = await res.text();
+        const t = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "bubble-callback-read");
         console.error(`[callback] non-ok status=${res.status} url=${url} body=${t.slice(0, 1000)}`);
         const retryable =
           res.status === 408 || res.status === 409 || res.status === 425 || res.status === 429 || res.status >= 500;
@@ -673,6 +734,8 @@ function pumpQueue() {
           },
           payload.callback_url
         );
+        // Clean up immediately after successful callback
+        jobs.delete(jobId);
       } catch (err) {
         logError("job-processing", err, {
           jobId,
@@ -699,8 +762,12 @@ function pumpQueue() {
             },
             payload.callback_url
           );
+          // Clean up immediately after successful callback
+          jobs.delete(jobId);
         } catch (cbErr) {
           logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
+          // Still clean up even if callback fails to prevent memory leak
+          setTimeout(() => jobs.delete(jobId), 5000);
         }
       } finally {
         activeWorkers = Math.max(0, activeWorkers - 1);
@@ -710,15 +777,17 @@ function pumpQueue() {
   }
 }
 
+// Cleanup every minute as safety net for jobs that fail to reach callback
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs.entries()) {
     const terminal = job.status === "completed" || job.status === "failed";
     if (!terminal) continue;
     const doneAt = new Date(job.completedAt || job.createdAt || now).getTime();
-    if (now - doneAt > JOB_TTL_MS) jobs.delete(id);
+    // Clean up terminal jobs older than 1 minute (main cleanup happens on callback)
+    if (now - doneAt > 60 * 1000) jobs.delete(id);
   }
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "casting-render-service" });
