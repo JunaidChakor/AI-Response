@@ -78,10 +78,7 @@ const normalizeUrl = (u) => {
   return t;
 };
 
-console.log("[URL DEBUG]", {
-  raw: videoUrl,
-  normalized: normalizeUrl(videoUrl)
-});
+
 
 const fetchOpts = {
   redirect: "follow",
