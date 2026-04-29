@@ -34,6 +34,16 @@ const MEDIA_HTTP_TIMEOUT_MS = Math.max(
   Number(process.env.HTTP_MEDIA_TIMEOUT_MS || 45 * 60 * 1000)
 );
 const FILE_ACTIVE_TIMEOUT_MS = Math.max(600000, Number(process.env.FILE_ACTIVE_TIMEOUT_MS || 45 * 60 * 1000));
+
+const cleanApiKey = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
+
 const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
 
 const ext = (n) => {
@@ -87,14 +97,7 @@ async function readWithTimeout(promise, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, lab
 }
 
 const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
-const cleanApiKey = (v) => {
-  if (v == null) return "";
-  const t = String(v).trim();
-  if (!t) return "";
-  const lower = t.toLowerCase();
-  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
-  return t;
-};
+
 const cleanOptionalUrl = (v) => {
   if (v == null) return "";
   const t = String(v).trim();
