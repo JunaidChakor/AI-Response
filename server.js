@@ -55,12 +55,33 @@ const guessMime = (name, fallback) => MIME[ext(name)] || fallback || "applicatio
 
 const normalizeUrl = (u) => {
   if (u == null) return "";
+
   let t = String(u).trim();
   if (!t) return "";
+
+  // remove whitespace + weird hidden chars
+  t = t.replace(/\s/g, "");
+
+  // fix double protocol bugs like https:https://
+  t = t.replace(/^https?:https?:\/\//i, "https://");
+  t = t.replace(/^http:\/https?:\/\//i, "https://");
+
+  // fix protocol duplication like https://https://
+  t = t.replace(/^https?:\/\/https?:\/\//i, "https://");
+
   if (t.startsWith("//")) return "https:" + t;
-  if (!/^https?:\/\//i.test(t)) return "https://" + t.replace(/^\/+/, "");
+
+  if (!/^https?:\/\//i.test(t)) {
+    return "https://" + t.replace(/^\/+/, "");
+  }
+
   return t;
 };
+
+console.log("[URL DEBUG]", {
+  raw: videoUrl,
+  normalized: normalizeUrl(videoUrl)
+});
 
 const fetchOpts = {
   redirect: "follow",
