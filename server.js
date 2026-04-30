@@ -557,8 +557,11 @@ async function analyzeCasting(properties) {
 
   const maxAttemptsPerModel = Math.max(1, Number(process.env.CALLBACK_MAX_ATTEMPTS || 4));
   const cycleDelayMs = Math.max(0, Number(process.env.MODEL_CYCLE_DELAY_MS || 8000));
-  const configuredMaxRetryMinutes = Number(process.env.MODEL_MAX_TOTAL_RETRY_MINUTES || 0);
-  const hasTotalRetryLimit = Number.isFinite(configuredMaxRetryMinutes) && configuredMaxRetryMinutes > 0;
+  const configuredMaxRetryMinutesRaw = Number(process.env.MODEL_MAX_TOTAL_RETRY_MINUTES || 0);
+  const configuredMaxRetryMinutes = Number.isFinite(configuredMaxRetryMinutesRaw)
+    ? Math.floor(configuredMaxRetryMinutesRaw)
+    : 0;
+  const hasTotalRetryLimit = configuredMaxRetryMinutes >= 1;
   const maxTotalRetryMs = hasTotalRetryLimit ? configuredMaxRetryMinutes * 60 * 1000 : 0;
   const retryStartMs = Date.now();
   let genAttempt = null;
