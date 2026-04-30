@@ -568,6 +568,7 @@ async function analyzeCasting(properties) {
       if (genAttempt.genRes.ok) break;
 
       finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
+      
       const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
       if (!shouldRetry) break;
 
@@ -688,21 +689,34 @@ function readBodyBuffer(req) {
   });
 }
 
+function decodeBubbleJsonText(text) {
+  return String(text || "")
+    .replace(/\uFEFF/g, "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/gi, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&amp;/g, "&");
+}
+
 /** Bubble often sends almost-valid JSON; parse POST /jobs here + jsonrepair fallback. */
 async function parseJobsBody(req, res, next) {
   if (req.method !== "POST" || normPath(req.path) !== "/jobs") return next();
   try {
     const buf = await readBodyBuffer(req);
     const raw = buf.toString("utf8");
+    const normalizedRaw = decodeBubbleJsonText(raw).trim();
     if (!raw.trim()) {
       req.body = {};
       return next();
     }
     try {
-      req.body = JSON.parse(raw);
+      req.body = JSON.parse(normalizedRaw);
     } catch (e) {
       try {
-        req.body = JSON.parse(jsonrepair(raw));
+        req.body = JSON.parse(jsonrepair(normalizedRaw));
       } catch (e2) {
         const m = String(e.message || "");
         const posMatch = m.match(/position (\d+)/i);
@@ -712,7 +726,7 @@ async function parseJobsBody(req, res, next) {
           hint:
             "In Bubble: API Connector → Body type JSON, and escape any \" inside text fields. Or send one field as Base64. Server also tried automatic repair.",
           detail: m,
-          snippetAroundError: raw.slice(Math.max(0, pos - 60), pos + 60),
+          snippetAroundError: normalizedRaw.slice(Math.max(0, pos - 60), pos + 60),
         });
       }
     }
