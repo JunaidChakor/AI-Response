@@ -35,17 +35,6 @@ const MEDIA_HTTP_TIMEOUT_MS = Math.max(
 );
 const FILE_ACTIVE_TIMEOUT_MS = Math.max(600000, Number(process.env.FILE_ACTIVE_TIMEOUT_MS || 45 * 60 * 1000));
 
-const cleanApiKey = (v) => {
-  if (v == null) return "";
-  const t = String(v).trim();
-  if (!t) return "";
-  const lower = t.toLowerCase();
-  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
-  return t;
-};
-
-const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
-
 const ext = (n) => {
   const i = String(n || "").lastIndexOf(".");
   return i >= 0 ? String(n).slice(i).toLowerCase() : "";
@@ -55,30 +44,46 @@ const guessMime = (name, fallback) => MIME[ext(name)] || fallback || "applicatio
 
 const normalizeUrl = (u) => {
   if (u == null) return "";
-
   let t = String(u).trim();
   if (!t) return "";
-
-  // remove whitespace + weird hidden chars
-  t = t.replace(/\s/g, "");
-
-  // fix double protocol bugs like https:https://
-  t = t.replace(/^https?:https?:\/\//i, "https://");
-  t = t.replace(/^http:\/https?:\/\//i, "https://");
-
-  // fix protocol duplication like https://https://
-  t = t.replace(/^https?:\/\/https?:\/\//i, "https://");
-
   if (t.startsWith("//")) return "https:" + t;
-
-  if (!/^https?:\/\//i.test(t)) {
-    return "https://" + t.replace(/^\/+/, "");
-  }
-
+  if (!/^https?:\/\//i.test(t)) return "https://" + t.replace(/^\/+/, "");
   return t;
 };
 
+function extractMediaToken(payload, fallbackUrl) {
+  const p = payload || {};
+  const envToken = cleanOptionalUrl(process.env.MEDIA_ACCESS_TOKEN);
+  if (envToken) return { token: envToken, tokenKey: "token" };
 
+  return { token: "", tokenKey: "token" };
+}
+
+function withMediaToken(url, token, tokenKey = "token") {
+  const abs = normalizeUrl(url);
+  if (!abs || !token) return abs;
+
+  try {
+    const parsed = new URL(abs);
+    parsed.searchParams.set(tokenKey || "token", token);
+    return parsed.toString();
+  } catch {
+    const sep = abs.includes("?") ? "&" : "?";
+    return `${abs}${sep}${encodeURIComponent(tokenKey || "token")}=${encodeURIComponent(token)}`;
+  }
+}
+
+function mediaFetchOpts() {
+  const token = cleanOptionalUrl(process.env.MEDIA_ACCESS_TOKEN);
+  if (!token) return fetchOpts;
+  return {
+    ...fetchOpts,
+    headers: {
+      ...fetchOpts.headers,
+      Authorization: `Bearer ${token}`,
+    },
+  };
+}
 
 const fetchOpts = {
   redirect: "follow",
@@ -115,7 +120,14 @@ async function readWithTimeout(promise, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, lab
 }
 
 const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
-
+const cleanApiKey = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
 const cleanOptionalUrl = (v) => {
   if (v == null) return "";
   const t = String(v).trim();
@@ -189,17 +201,17 @@ const roleCharsText = (rc) => {
   }
 };
 
-async function fetchBinary(url, authToken = "") {
+async function fetchBinary(url) {
+  return fetchBinaryWithOptions(url, mediaFetchOpts());
+}
+
+async function fetchBinaryWithOptions(url, options) {
   const abs = normalizeUrl(url);
   console.log("Fetching:", abs);
   if (!abs) throw new Error("Missing file URL");
 
   const t0 = Date.now();
-  const opts = { ...fetchOpts };
-  if (authToken) {
-    opts.headers = { ...opts.headers, "Authorization": `Bearer ${authToken}` };
-  }
-  const res = await fetchWithTimeout(abs, opts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
+  const res = await fetchWithTimeout(abs, options || fetchOpts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
   if (!res.ok) throw new Error(`Fetch ${res.status}: ${abs}`);
 
   console.log(`[fetchBinary] response headers received url=${abs}`);
@@ -382,8 +394,9 @@ async function analyzeCasting(properties) {
 
   const resumeUrl = p.resume_url ? normalizeUrl(p.resume_url) : "";
   const headshotUrl = p.headshot_url ? normalizeUrl(p.headshot_url) : "";
+  const videoFetchUrl = videoUrl;
 
-  const vf = await fetchBinary(videoUrl, MEDIA_ACCESS_TOKEN);
+  const vf = await fetchBinary(videoFetchUrl);
   if (vf.size > LIM.v) throw new Error("Video too large");
 
   const parts = [];
@@ -397,7 +410,7 @@ async function analyzeCasting(properties) {
   let headshotProvided = false;
 
   if (resumeUrl) {
-    const rf = await fetchBinary(resumeUrl, MEDIA_ACCESS_TOKEN);
+    const rf = await fetchBinary(resumeUrl);
     if (rf.size > LIM.r) throw new Error("Resume too large");
     const resumeMime = guessMime(rf.name, "application/pdf");
     const normalizedResume = await convertOfficeToPdfIfNeeded(
@@ -417,7 +430,7 @@ async function analyzeCasting(properties) {
   }
 
   if (headshotUrl) {
-    const hf = await fetchBinary(headshotUrl, MEDIA_ACCESS_TOKEN);
+    const hf = await fetchBinary(headshotUrl);
     if (hf.size > LIM.h) throw new Error("Headshot too large");
     const hUp = await upload(apiKey, hf.buffer, hf.name || "headshot.jpg", guessMime(hf.name, "image/jpeg"));
     await waitActive(apiKey, hUp.name);
@@ -471,7 +484,7 @@ async function analyzeCasting(properties) {
     "\n\nAPPLICANT\n" +
     "Gender: " + s(p.user_gender) +
     "\nAge: " + s(p.user_age) +
-    "\nLocation: " + s(p.user_location) + " (applicant)" +
+    "\nLocation: " + s(p.user_location) + + " (applicant)" +
     "\nHeight: " + s(p.user_height) +
     "\nHeadshot URL (text field): " + (headshotText || "(not provided)") +
     "\nDrive Folder Link: " + (drive || "(not provided)") +
@@ -755,8 +768,6 @@ function pumpQueue() {
           },
           payload.callback_url
         );
-        // Clean up immediately after successful callback
-        jobs.delete(jobId);
       } catch (err) {
         logError("job-processing", err, {
           jobId,
@@ -783,12 +794,8 @@ function pumpQueue() {
             },
             payload.callback_url
           );
-          // Clean up immediately after successful callback
-          jobs.delete(jobId);
         } catch (cbErr) {
           logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
-          // Still clean up even if callback fails to prevent memory leak
-          setTimeout(() => jobs.delete(jobId), 5000);
         }
       } finally {
         activeWorkers = Math.max(0, activeWorkers - 1);
@@ -798,17 +805,15 @@ function pumpQueue() {
   }
 }
 
-// Cleanup every minute as safety net for jobs that fail to reach callback
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs.entries()) {
     const terminal = job.status === "completed" || job.status === "failed";
     if (!terminal) continue;
     const doneAt = new Date(job.completedAt || job.createdAt || now).getTime();
-    // Clean up terminal jobs older than 1 minute (main cleanup happens on callback)
-    if (now - doneAt > 60 * 1000) jobs.delete(id);
+    if (now - doneAt > JOB_TTL_MS) jobs.delete(id);
   }
-}, 60 * 1000);
+}, 5 * 60 * 1000);
 
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "casting-render-service" });
