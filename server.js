@@ -555,28 +555,52 @@ async function analyzeCasting(properties) {
     return isCapacityStatus || isHighDemand;
   };
 
-  const maxAttemptsPerModel = Math.max(1, Number(process.env.MODEL_MAX_ATTEMPTS || 3));
+  const maxAttemptsPerModel = Math.max(1, Number(process.env.CALLBACK_MAX_ATTEMPTS || 4));
+  const cycleDelayMs = Math.max(0, Number(process.env.MODEL_CYCLE_DELAY_MS || 8000));
+  const configuredMaxRetryMinutes = Number(process.env.MODEL_MAX_TOTAL_RETRY_MINUTES || 0);
+  const hasTotalRetryLimit = Number.isFinite(configuredMaxRetryMinutes) && configuredMaxRetryMinutes > 0;
+  const maxTotalRetryMs = hasTotalRetryLimit ? configuredMaxRetryMinutes * 60 * 1000 : 0;
+  const retryStartMs = Date.now();
   let genAttempt = null;
   let finalError = null;
 
-  for (let modelIndex = 0; modelIndex < modelPriority.length; modelIndex++) {
-    const modelName = modelPriority[modelIndex];
-    console.log(`[model-selection] trying model=${modelName} order=${modelIndex + 1}/${modelPriority.length}`);
+  while (true) {
+    if (hasTotalRetryLimit && Date.now() - retryStartMs >= maxTotalRetryMs) {
+      throw new Error(
+        `Model retry window exceeded (${configuredMaxRetryMinutes} minute(s)) without a successful response.`
+      );
+    }
 
-    for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt++) {
-      genAttempt = await callGenerateContent(modelName);
-      if (genAttempt.genRes.ok) break;
+    for (let modelIndex = 0; modelIndex < modelPriority.length; modelIndex++) {
+      const modelName = modelPriority[modelIndex];
+      console.log(`[model-selection] trying model=${modelName} order=${modelIndex + 1}/${modelPriority.length}`);
 
-      finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
-      const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
-      if (!shouldRetry) break;
+      for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt++) {
+        genAttempt = await callGenerateContent(modelName);
+        if (genAttempt.genRes.ok) break;
 
-      const baseBackoffMs = Math.min(20000, 1200 * Math.pow(2, attempt - 1));
-      const jitterMs = Math.floor(Math.random() * 500);
-      await sleep(baseBackoffMs + jitterMs);
+        finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
+        const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
+        if (!shouldRetry) break;
+
+        const baseBackoffMs = Math.min(20000, 1200 * Math.pow(2, attempt - 1));
+        const jitterMs = Math.floor(Math.random() * 500);
+        await sleep(baseBackoffMs + jitterMs);
+      }
+
+      if (genAttempt?.genRes?.ok) break;
     }
 
     if (genAttempt?.genRes?.ok) break;
+    if (hasTotalRetryLimit && Date.now() - retryStartMs >= maxTotalRetryMs) {
+      throw new Error(
+        `Model retry window exceeded (${configuredMaxRetryMinutes} minute(s)) without a successful response.`
+      );
+    }
+    console.log(
+      `[model-selection] all models failed this round; waiting ${cycleDelayMs}ms before restarting from first model`
+    );
+    await sleep(cycleDelayMs);
   }
 
   if (!genAttempt || !genAttempt.genRes.ok) {
@@ -746,6 +770,23 @@ function totalOutstandingJobs() {
   return queueDepth() + activeWorkers;
 }
 
+function buildFallbackCastingResult(err) {
+  const message = s(err?.message || err) || "Model evaluation failed";
+  return {
+    overall_assessment:
+      "We could not complete AI evaluation at this time due to temporary model availability or quota limits. Please retry shortly.",
+    strengths: [],
+    considerations: [
+      "Automated evaluation was unavailable for this attempt.",
+      message,
+    ],
+    recommendation: "Retry evaluation with the same submission after a short delay.",
+    ai_score: 0,
+    error: message,
+    is_fallback: true,
+  };
+}
+
 function pumpQueue() {
   while (activeWorkers < MAX_CONCURRENT_JOBS && pendingQueue.length > 0) {
     const item = pendingQueue.shift();
@@ -761,6 +802,7 @@ function pumpQueue() {
     jobs.set(jobId, { ...existing, status: "processing", startedAt: new Date().toISOString() });
 
     (async () => {
+      let callbackPayload = null;
       try {
         const result = await analyzeCasting(payload);
         const curr = jobs.get(jobId);
@@ -773,45 +815,43 @@ function pumpQueue() {
           });
         }
         console.log(`[jobs] completed id=${jobId}`);
-
-        await sendBubbleCallback(
-          {
-            status: "completed",
-            application_id: payload.application_id ?? null,
-            video_link: payload.video_link ?? payload.video_url ?? null,
-            ...result,
-          },
-          payload.callback_url
-        );
+        callbackPayload = {
+          status: "completed",
+          application_id: payload.application_id ?? null,
+          video_link: payload.video_link ?? payload.video_url ?? null,
+          ...result,
+        };
       } catch (err) {
         logError("job-processing", err, {
           jobId,
           application_id: payload?.application_id ?? null,
           video_link: payload?.video_link ?? payload?.video_url ?? null,
         });
+        const fallbackResult = buildFallbackCastingResult(err);
         const curr = jobs.get(jobId);
         if (curr) {
           jobs.set(jobId, {
             ...curr,
-            status: "failed",
+            status: "completed_with_fallback",
             completedAt: new Date().toISOString(),
+            result: fallbackResult,
             error: String(err?.message || err),
           });
         }
+        callbackPayload = {
+          status: "completed_with_fallback",
+          application_id: payload.application_id ?? null,
+          video_link: payload.video_link ?? payload.video_url ?? null,
+          ...fallbackResult,
+        };
+      }
 
-        try {
-          await sendBubbleCallback(
-            {
-              status: "failed",
-              application_id: payload.application_id ?? null,
-              video_link: payload.video_link ?? payload.video_url ?? null,
-              error: String(err?.message || err),
-            },
-            payload.callback_url
-          );
-        } catch (cbErr) {
-          logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
+      try {
+        if (callbackPayload) {
+          await sendBubbleCallback(callbackPayload, payload.callback_url);
         }
+      } catch (cbErr) {
+        logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
       } finally {
         activeWorkers = Math.max(0, activeWorkers - 1);
         setImmediate(pumpQueue);
@@ -823,7 +863,10 @@ function pumpQueue() {
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs.entries()) {
-    const terminal = job.status === "completed" || job.status === "failed";
+    const terminal =
+      job.status === "completed" ||
+      job.status === "failed" ||
+      job.status === "completed_with_fallback";
     if (!terminal) continue;
     const doneAt = new Date(job.completedAt || job.createdAt || now).getTime();
     if (now - doneAt > JOB_TTL_MS) jobs.delete(id);
