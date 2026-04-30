@@ -1,4 +1,4 @@
-  import express from "express";
+import express from "express";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { jsonrepair } from "jsonrepair";
@@ -46,13 +46,22 @@ const normalizeUrl = (u) => {
   if (u == null) return "";
   let t = String(u).trim();
   if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
   t = t.replace(/\s/g, "");
   t = t.replace(/^https?:https?:\/\//i, "https://");
   t = t.replace(/^http:\/https?:\/\//i, "https://");
   t = t.replace(/^https?:\/\/https?:\/\//i, "https://");
   if (t.startsWith("//")) return "https:" + t;
-  if (!/^https?:\/\//i.test(t)) return "https://" + t.replace(/^\/+/, "");
-  return t;
+  if (!/^https?:\/\//i.test(t)) t = "https://" + t.replace(/^\/+/, "");
+  try {
+    const parsed = new URL(t);
+    const host = String(parsed.hostname || "").toLowerCase();
+    if (!host || host === "null" || host === "undefined" || host === "none" || host === "false") return "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
 };
 
 function extractMediaToken(payload, fallbackUrl) {
@@ -77,8 +86,8 @@ function withMediaToken(url, token, tokenKey = "token") {
   }
 }
 
-function mediaFetchOpts() {
-  const token = cleanOptionalUrl(process.env.MEDIA_ACCESS_TOKEN);
+function mediaFetchOpts(authToken = MEDIA_ACCESS_TOKEN) {
+  const token = cleanOptionalUrl(authToken);
   if (!token) return fetchOpts;
   return {
     ...fetchOpts,
@@ -140,6 +149,8 @@ const cleanOptionalUrl = (v) => {
   if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
   return t;
 };
+
+const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
 const parseModelList = (v) => {
   if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
   const t = String(v || "").trim();
@@ -205,8 +216,8 @@ const roleCharsText = (rc) => {
   }
 };
 
-async function fetchBinary(url) {
-  return fetchBinaryWithOptions(url, mediaFetchOpts());
+async function fetchBinary(url, authToken = MEDIA_ACCESS_TOKEN) {
+  return fetchBinaryWithOptions(url, mediaFetchOpts(authToken));
 }
 
 async function fetchBinaryWithOptions(url, options) {
@@ -400,7 +411,7 @@ async function analyzeCasting(properties) {
   const headshotUrl = p.headshot_url ? normalizeUrl(p.headshot_url) : "";
   const videoFetchUrl = videoUrl;
 
-  const vf = await fetchBinary(videoFetchUrl);
+  const vf = await fetchBinary(videoFetchUrl, MEDIA_ACCESS_TOKEN);
   if (vf.size > LIM.v) throw new Error("Video too large");
 
   const parts = [];
@@ -414,7 +425,7 @@ async function analyzeCasting(properties) {
   let headshotProvided = false;
 
   if (resumeUrl) {
-    const rf = await fetchBinary(resumeUrl);
+    const rf = await fetchBinary(resumeUrl, MEDIA_ACCESS_TOKEN);
     if (rf.size > LIM.r) throw new Error("Resume too large");
     const resumeMime = guessMime(rf.name, "application/pdf");
     const normalizedResume = await convertOfficeToPdfIfNeeded(
@@ -434,7 +445,7 @@ async function analyzeCasting(properties) {
   }
 
   if (headshotUrl) {
-    const hf = await fetchBinary(headshotUrl);
+    const hf = await fetchBinary(headshotUrl, MEDIA_ACCESS_TOKEN);
     if (hf.size > LIM.h) throw new Error("Headshot too large");
     const hUp = await upload(apiKey, hf.buffer, hf.name || "headshot.jpg", guessMime(hf.name, "image/jpeg"));
     await waitActive(apiKey, hUp.name);
