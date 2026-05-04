@@ -3,9 +3,6 @@ import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { promisify } from "node:util";
 import libre from "libreoffice-convert";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const TWELVELABS_API_KEY = "tlk_1ZH8HRF3JX8K122X1J4YR2CN4AJA";
 const TWELVELABS_BASE_URL = "https://api.twelvelabs.io/v1";
