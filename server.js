@@ -3,7 +3,6 @@ import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
 import { promisify } from "node:util";
 import libre from "libreoffice-convert";
-import dotenv from "dotenv";
 
 dotenv.config();
 
