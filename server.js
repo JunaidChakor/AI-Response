@@ -1,15 +1,20 @@
 import express from "express";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
-import { jsonrepair } from "jsonrepair";
-import libre from "libreoffice-convert";
 import { promisify } from "node:util";
+import libre from "libreoffice-convert";
+import dotenv from "dotenv";
 
-const UP = "https://generativelanguage.googleapis.com/upload/v1beta/files";
-const FILES = "https://generativelanguage.googleapis.com/v1beta/files";
+dotenv.config();
+
+const TWELVELABS_API_KEY = "tlk_1ZH8HRF3JX8K122X1J4YR2CN4AJA";
+const TWELVELABS_BASE_URL = "https://api.twelvelabs.io/v1";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const libreConvertAsync = promisify(libre.convert);
 
 const LIM = {
-  v: 500 * 1024 * 1024,
+  v: 4 * 1024 * 1024 * 1024,  // 4GB for multipart upload (12Labs limit)
   r: 5 * 1024 * 1024,
   h: 10 * 1024 * 1024,
 };
@@ -25,15 +30,6 @@ const MIME = {
   ".jpeg": "image/jpeg",
   ".png": "image/png",
 };
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const libreConvertAsync = promisify(libre.convert);
-const DEFAULT_HTTP_TIMEOUT_MS = Math.max(5000, Number(process.env.HTTP_TIMEOUT_MS || 180000));
-const MEDIA_HTTP_TIMEOUT_MS = Math.max(
-  DEFAULT_HTTP_TIMEOUT_MS,
-  Number(process.env.HTTP_MEDIA_TIMEOUT_MS || 45 * 60 * 1000)
-);
-const FILE_ACTIVE_TIMEOUT_MS = Math.max(600000, Number(process.env.FILE_ACTIVE_TIMEOUT_MS || 45 * 60 * 1000));
 
 const ext = (n) => {
   const i = String(n || "").lastIndexOf(".");
@@ -64,13 +60,25 @@ const normalizeUrl = (u) => {
   }
 };
 
-function extractMediaToken(payload, fallbackUrl) {
-  const p = payload || {};
-  const envToken = cleanOptionalUrl(process.env.MEDIA_ACCESS_TOKEN);
-  if (envToken) return { token: envToken, tokenKey: "token" };
+const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
+const cleanApiKey = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
+const cleanOptionalUrl = (v) => {
+  if (v == null) return "";
+  const t = String(v).trim();
+  if (!t) return "";
+  const lower = t.toLowerCase();
+  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
+  return t;
+};
 
-  return { token: "", tokenKey: "token" };
-}
+const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
 
 function withMediaToken(url, token, tokenKey = "token") {
   const abs = normalizeUrl(url);
@@ -100,10 +108,10 @@ function mediaFetchOpts(authToken = MEDIA_ACCESS_TOKEN) {
 
 const fetchOpts = {
   redirect: "follow",
-  headers: { "User-Agent": "CastingRenderService/1" },
+  headers: { "User-Agent": "CastingRenderService-TwelveLabs/1" },
 };
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-request") {
+async function fetchWithTimeout(url, options = {}, timeoutMs = 180000, label = "http-request") {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
   try {
@@ -117,57 +125,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_HTTP_TIME
     clearTimeout(timeoutId);
   }
 }
-
-async function readWithTimeout(promise, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, label = "http-read") {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-const s = (v) => (v == null ? "" : String(v).replace(/\0/g, ""));
-const cleanApiKey = (v) => {
-  if (v == null) return "";
-  const t = String(v).trim();
-  if (!t) return "";
-  const lower = t.toLowerCase();
-  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
-  return t;
-};
-const cleanOptionalUrl = (v) => {
-  if (v == null) return "";
-  const t = String(v).trim();
-  if (!t) return "";
-  const lower = t.toLowerCase();
-  if (lower === "null" || lower === "undefined" || lower === "none" || lower === "false") return "";
-  return t;
-};
-
-const MEDIA_ACCESS_TOKEN = cleanApiKey(process.env.MEDIA_ACCESS_TOKEN) || "";
-const parseModelList = (v) => {
-  if (Array.isArray(v)) return v.map((x) => String(x || "").trim()).filter(Boolean);
-  const t = String(v || "").trim();
-  if (!t) return [];
-  if (t.startsWith("[") && t.endsWith("]")) {
-    try {
-      const arr = JSON.parse(t);
-      if (Array.isArray(arr)) return arr.map((x) => String(x || "").trim()).filter(Boolean);
-    } catch {
-      /* fall through to CSV parsing */
-    }
-  }
-  return t
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-};
 
 function logError(stage, err, context = {}) {
   const message = String(err?.message || err);
@@ -183,7 +140,6 @@ function logError(stage, err, context = {}) {
   if (stack) console.error(stack);
 }
 
-/** Parse JSON from Gemini/HTTP bodies; strips BOM, markdown fences, or leading junk. */
 function parseJsonSafe(raw, label) {
   let t = String(raw ?? "").trim();
   if (!t) throw new Error(`${label}: empty body`);
@@ -206,31 +162,26 @@ function parseJsonSafe(raw, label) {
   }
 }
 
-const roleCharsText = (rc) => {
-  try {
-    if (rc == null) return "";
-    if (Array.isArray(rc)) return rc.map((x) => s(x)).join("\n");
-    return s(rc);
-  } catch {
-    return "";
-  }
-};
-
 async function fetchBinary(url, authToken = MEDIA_ACCESS_TOKEN) {
-  return fetchBinaryWithOptions(url, mediaFetchOpts(authToken));
-}
-
-async function fetchBinaryWithOptions(url, options) {
-  const abs = normalizeUrl(url);
-  console.log("Fetching:", abs);
+  let abs = normalizeUrl(url);
+  console.log("[fetchBinary] Fetching:", abs);
   if (!abs) throw new Error("Missing file URL");
 
+  // For Bubble URLs, add token as query parameter AND Bearer auth header
+  const isBubbleUrl = abs.includes("bubble.io");
+  if (isBubbleUrl && authToken && authToken.trim()) {
+    abs = withMediaToken(abs, authToken, "token");
+    console.log("[fetchBinary] Added token to Bubble URL");
+  }
+
   const t0 = Date.now();
-  const res = await fetchWithTimeout(abs, options || fetchOpts, MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:request");
+  const opts = mediaFetchOpts(authToken);
+  
+  const res = await fetchWithTimeout(abs, opts, 45 * 60 * 1000, "fetchBinary:request");
   if (!res.ok) throw new Error(`Fetch ${res.status}: ${abs}`);
 
   console.log(`[fetchBinary] response headers received url=${abs}`);
-  const ab = await readWithTimeout(res.arrayBuffer(), MEDIA_HTTP_TIMEOUT_MS, "fetchBinary:body");
+  const ab = await res.arrayBuffer();
   let name = "file";
 
   try {
@@ -245,373 +196,284 @@ async function fetchBinaryWithOptions(url, options) {
   return { buffer, name, size: buffer.length };
 }
 
-async function upload(apiKey, fileBuffer, displayName, mimeType) {
-  const mid = Buffer.isBuffer(fileBuffer) ? fileBuffer : Buffer.from(fileBuffer);
-  const size = mid.length;
-  if (!size) throw new Error("Empty file buffer");
-
-  let base = String(displayName || "file").split(/[\\/]/).pop() || "file";
-  base = base.split("?")[0].split("#")[0];
-  base = base.replace(/[^\x20-\x7E]/g, "_").replace(/["\\\r\n]/g, "_");
-  if (!base || base === "." || base === "..") base = "file.bin";
-
-  let safeName = base.slice(0, 80);
-  let meta = JSON.stringify({ file: { display_name: safeName, mime_type: mimeType } });
-
-  while (meta.length > 520 && safeName.length > 8) {
-    safeName = safeName.slice(0, Math.max(8, safeName.length - 12));
-    meta = JSON.stringify({ file: { display_name: safeName, mime_type: mimeType } });
-  }
-
-  if (meta.length > 600) {
-    meta = JSON.stringify({ file: { display_name: "upload.bin", mime_type: mimeType } });
-  }
-
-  const startRes = await fetchWithTimeout(
-    `${UP}?key=${encodeURIComponent(apiKey)}`,
-    {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Goog-Upload-Protocol": "resumable",
-      "X-Goog-Upload-Command": "start",
-      "X-Goog-Upload-Header-Content-Length": String(size),
-      "X-Goog-Upload-Header-Content-Type": mimeType,
-    },
-    body: meta,
-    },
-    DEFAULT_HTTP_TIMEOUT_MS,
-    "upload:start"
-  );
-
-  const uploadUrl = startRes.headers.get("x-goog-upload-url") || startRes.headers.get("X-Goog-Upload-Url");
-  if (!uploadUrl) {
-    const t = await readWithTimeout(startRes.text(), DEFAULT_HTTP_TIMEOUT_MS, "upload:start-read");
-    throw new Error(`Upload start ${startRes.status}: ${t.slice(0, 800)}`);
-  }
-
-  const upRes = await fetchWithTimeout(
-    uploadUrl.trim(),
-    {
-    method: "POST",
-    headers: {
-      "X-Goog-Upload-Offset": "0",
-      "X-Goog-Upload-Command": "upload, finalize",
-      "Content-Type": mimeType,
-    },
-    body: mid,
-    },
-    MEDIA_HTTP_TIMEOUT_MS,
-    "upload:bytes"
-  );
-
-  const text = await readWithTimeout(upRes.text(), MEDIA_HTTP_TIMEOUT_MS, "upload:bytes-read");
-
-  let json;
+async function indexVideoWith12Labs(videoBuffer, videoName) {
+  console.log("[12labs] Uploading video for indexing...");
+  
+  // Create FormData for multipart upload
+  const formData = new FormData();
+  const blob = new Blob([videoBuffer], { type: "video/mp4" });
+  formData.append("file", blob, videoName);
+  formData.append("index_name", `casting-${uuidv4()}`);
+  
   try {
-    json = parseJsonSafe(text, "upload-bytes");
-  } catch (e) {
-    throw new Error(`Upload bytes ${upRes.status}: ${e.message || text.slice(0, 800)}`);
-  }
+    const uploadRes = await fetchWithTimeout(
+      `${TWELVELABS_BASE_URL}/indexes/tasks/index`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TWELVELABS_API_KEY}`,
+        },
+        body: formData,
+      },
+      45 * 60 * 1000,
+      "12labs:index"
+    );
 
-  if (!upRes.ok) {
-    const msg = json?.error?.message || text;
-    if (upRes.status === 400 && /quicktime|mov|unsupported|codec|hevc|h\.265/i.test(msg)) {
-      throw new Error("Video format appears unsupported by Gemini. Convert to MP4 H.264 + AAC, then retry.");
+    const uploadText = await uploadRes.text();
+    console.log(`[12labs] index response status=${uploadRes.status}`);
+
+    if (!uploadRes.ok) {
+      throw new Error(`12Labs index failed ${uploadRes.status}: ${uploadText.slice(0, 800)}`);
     }
-    throw new Error(msg);
-  }
 
-  const file = json.file || json;
-  if (!file.name || !file.uri) throw new Error(`Bad upload: ${text.slice(0, 400)}`);
-
-  return { name: file.name, uri: file.uri, mimeType };
-}
-
-async function uploadVideoWithMovFallback(apiKey, buffer, filename, preferredMime) {
-  try {
-    return await upload(apiKey, buffer, filename || "audition.mp4", preferredMime);
-  } catch (e) {
-    const em = String(e?.message || e);
-    const fn = String(filename || "");
-    const looksMov = /\.mov$/i.test(fn);
-    const wasQuicktime = /quicktime/i.test(preferredMime || "");
-
-    if (looksMov && wasQuicktime && /400|codec|unsupported|invalid|failed|quicktime|process/i.test(em)) {
-      const altName = fn.replace(/\.mov$/i, ".mp4");
-      return await upload(apiKey, buffer, altName || "audition.mp4", "video/mp4");
+    let uploadJson;
+    try {
+      uploadJson = parseJsonSafe(uploadText, "12labs-index");
+    } catch (e) {
+      throw new Error(`Invalid 12Labs response: ${e.message}`);
     }
+
+    const taskId = uploadJson.task_id || uploadJson.id;
+    if (!taskId) throw new Error(`No task_id in 12Labs response: ${uploadText.slice(0, 400)}`);
+
+    console.log(`[12labs] task_id=${taskId}`);
+    return taskId;
+  } catch (e) {
+    logError("12labs-index", e);
     throw e;
   }
 }
 
-async function convertOfficeToPdfIfNeeded(fileBuffer, filename, mimeType) {
-  const name = String(filename || "resume").toLowerCase();
-  const isDoc = mimeType === "application/msword" || name.endsWith(".doc");
-  const isDocx =
-    mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-    name.endsWith(".docx");
-  if (!isDoc && !isDocx) {
-    return { buffer: fileBuffer, mimeType, filename };
+async function waitFor12LabsTask(taskId, maxWaitMs = 15 * 60 * 1000) {
+  console.log(`[12labs] Waiting for task ${taskId} to complete...`);
+  const t0 = Date.now();
+  
+  while (Date.now() - t0 < maxWaitMs) {
+    try {
+      const statusRes = await fetchWithTimeout(
+        `${TWELVELABS_BASE_URL}/tasks/${taskId}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${TWELVELABS_API_KEY}`,
+          },
+        },
+        30000,
+        "12labs:status"
+      );
+
+      const statusText = await statusRes.text();
+      if (!statusRes.ok) {
+        console.error(`[12labs] status check failed ${statusRes.status}: ${statusText.slice(0, 500)}`);
+        await sleep(5000);
+        continue;
+      }
+
+      let statusJson;
+      try {
+        statusJson = parseJsonSafe(statusText, "12labs-status");
+      } catch (e) {
+        console.error(`[12labs] parse error: ${e.message}`);
+        await sleep(5000);
+        continue;
+      }
+
+      const status = statusJson.status || statusJson.state;
+      console.log(`[12labs] task status=${status}`);
+
+      if (status === "SUCCEEDED" || status === "completed") {
+        console.log(`[12labs] task completed`);
+        return statusJson;
+      }
+
+      if (status === "FAILED" || status === "error") {
+        throw new Error(`Task failed: ${statusText}`);
+      }
+
+      await sleep(5000);
+    } catch (e) {
+      logError("12labs-wait", e);
+      await sleep(5000);
+    }
   }
-  try {
-    const pdfBuf = await libreConvertAsync(fileBuffer, ".pdf", undefined);
-    const outName = String(filename || "resume").replace(/\.(docx?|DOCX?)$/, ".pdf");
-    return { buffer: pdfBuf, mimeType: "application/pdf", filename: outName };
-  } catch (e) {
-    throw new Error(
-      "DOC/DOCX to PDF conversion failed on server. Install LibreOffice in runtime or upload PDF directly. Details: " +
-        String(e?.message || e)
-    );
-  }
+
+  throw new Error("Timeout waiting for 12Labs task completion");
 }
 
-async function waitActive(apiKey, fileName) {
-  const id = String(fileName).replace(/^files\//, "");
-  const url = `${FILES}/${encodeURIComponent(id)}?key=${encodeURIComponent(apiKey)}`;
-  const t0 = Date.now();
+async function queryVideoWith12Labs(videoId, prompt) {
+  console.log("[12labs] Querying video with casting prompt...");
+  
+  const queryPayload = {
+    video_id: videoId,
+    prompt: prompt,
+  };
 
-  while (Date.now() - t0 < FILE_ACTIVE_TIMEOUT_MS) {
-    const res = await fetchWithTimeout(url, fetchOpts, DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status");
-    const text = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "waitActive:status-read");
+  try {
+    const queryRes = await fetchWithTimeout(
+      `${TWELVELABS_BASE_URL}/search`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TWELVELABS_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(queryPayload),
+      },
+      60000,
+      "12labs:query"
+    );
 
-    let json;
-    try {
-      json = parseJsonSafe(text, "file-status");
-    } catch (e) {
-      throw new Error(`File status ${res.status}: ${e.message || text.slice(0, 300)}`);
+    const queryText = await queryRes.text();
+    console.log(`[12labs] query response status=${queryRes.status}`);
+
+    if (!queryRes.ok) {
+      throw new Error(`12Labs query failed ${queryRes.status}: ${queryText.slice(0, 800)}`);
     }
 
-    if (!res.ok) throw new Error(json?.error?.message || text);
-    if (json.state === "ACTIVE") return json;
-    if (json.state === "FAILED") throw new Error(`File FAILED: ${text}`);
+    let queryJson;
+    try {
+      queryJson = parseJsonSafe(queryText, "12labs-query");
+    } catch (e) {
+      throw new Error(`Invalid 12Labs query response: ${e.message}`);
+    }
 
-    await sleep(2000);
+    return queryJson;
+  } catch (e) {
+    logError("12labs-query", e);
+    throw e;
   }
-
-  throw new Error("Timeout waiting for file ACTIVE");
 }
 
-async function analyzeCasting(properties) {
+function buildCastingPrompt(p) {
+  const roleCharsText = (rc) => {
+    try {
+      if (rc == null) return "";
+      if (Array.isArray(rc)) return rc.map((x) => s(x)).join("\n");
+      return s(rc);
+    } catch {
+      return "";
+    }
+  };
+
+  const headshotText = p.headshot_url ? normalizeUrl(p.headshot_url) : "";
+  const drive = p.drive_folder_link ? normalizeUrl(p.drive_folder_link) : "";
+
+  return `You are an expert casting evaluator for film and streaming projects.
+
+Task: Analyze the full audition video from start to end, then return a strict JSON decision for casting.
+
+Critical rules:
+1. You must always return all required keys: ai_score, overall_assessment, strengths, considerations, recommendation.
+2. ai_score must be an integer from 0 to 100.
+3. strengths and considerations must be arrays of short strings.
+4. recommendation must be exactly one of: callback, hold_for_more_material, not_a_fit.
+5. Do not output markdown or any text outside JSON.
+
+Project and role data:
+Project Title: ${s(p.PROJECT_TITLE)}
+Project Overview: ${s(p.project_overview)}
+Casting For: ${s(p.casting_for)}
+
+Role Type: ${s(p.role_type)}
+Role Gender: ${s(p.role_gender)}
+Role Description: ${s(p.role_description)}
+Role Requirements: ${s(p.role_requirements)}
+Role Characteristics: ${roleCharsText(p.role_characteristics)}
+Age Range: ${s(p.age_range)}
+Location: ${s(p.location)} (role)
+Minimum Height: ${s(p.minimum_height)}
+Maximum Height: ${s(p.maximum_height)}
+Minimum AI Score: ${s(p.minimum_ai_score)}
+
+Applicant data:
+Gender: ${s(p.user_gender)}
+Age: ${s(p.user_age)}
+Location: ${s(p.user_location)} (applicant)
+Height: ${s(p.user_height)}
+About: ${s(p.about_person)}
+Bio: ${s(p.bio)}
+
+Evaluation focus:
+- Performance and presence: confidence, pacing, authenticity, camera connection
+- Voice and speech: clarity, articulation, emotional tone
+- Face and body: expression range, eye focus, posture, gesture control
+- Role fit: alignment with role description and requirements
+- Production readiness
+
+Return ONLY this JSON structure with all fields present:
+{
+  "ai_score": 0,
+  "overall_assessment": "",
+  "strengths": [],
+  "considerations": [],
+  "recommendation": ""
+}
+
+Decision rules:
+- If ai_score is below ${s(p.minimum_ai_score)}, recommendation must be not_a_fit.
+- If evidence is limited, use hold_for_more_material unless ai_score is very high.
+- If role context is missing, cap ai_score at 70.`;
+}
+
+async function analyzeCastingWith12Labs(properties) {
   const p = properties || {};
-  const apiKey = cleanApiKey(p.gemini_api_key) || cleanApiKey(p.api_key) || cleanApiKey(process.env.GEMINI_API_KEY);
-  const requestModelList = parseModelList(p.models);
-  const envModelList = parseModelList(process.env.MODEL_PRIORITY);
-  const modelPriority = Array.from(new Set([...requestModelList, ...envModelList].filter(Boolean)));
   const videoUrl = normalizeUrl(p.video_url);
 
-  if (!apiKey) throw new Error("gemini_api_key required or set GEMINI_API_KEY env var");
-  if (!modelPriority.length) {
-    throw new Error("No models configured. Provide `models` in request or set MODEL_PRIORITY env var.");
-  }
-  console.log(`[model-selection] priority=${modelPriority.join(" -> ")}`);
   if (!videoUrl) throw new Error("video_url required");
 
-  const resumeUrl = p.resume_url ? normalizeUrl(p.resume_url) : "";
-  const headshotUrl = p.headshot_url ? normalizeUrl(p.headshot_url) : "";
-  const videoFetchUrl = videoUrl;
+  console.log(`[casting] Starting 12Labs analysis for video: ${videoUrl}`);
 
-  const vf = await fetchBinary(videoFetchUrl, MEDIA_ACCESS_TOKEN);
+  // Fetch video
+  const vf = await fetchBinary(videoUrl, MEDIA_ACCESS_TOKEN);
   if (vf.size > LIM.v) throw new Error("Video too large");
 
-  const parts = [];
-  const videoMime = p.video_mime ? String(p.video_mime).trim() : guessMime(vf.name, "video/mp4");
+  // Index with 12Labs
+  const taskId = await indexVideoWith12Labs(vf.buffer, vf.name || "audition.mp4");
 
-  const vUp = await uploadVideoWithMovFallback(apiKey, vf.buffer, vf.name || "audition.mp4", videoMime);
-  await waitActive(apiKey, vUp.name);
-  parts.push({ file_data: { mime_type: vUp.mimeType, file_uri: vUp.uri } });
+  // Wait for indexing
+  const taskResult = await waitFor12LabsTask(taskId);
+  const videoId = taskResult.video_id || taskResult.id;
 
-  let resumeProvided = false;
-  let headshotProvided = false;
-
-  if (resumeUrl) {
-    const rf = await fetchBinary(resumeUrl, MEDIA_ACCESS_TOKEN);
-    if (rf.size > LIM.r) throw new Error("Resume too large");
-    const resumeMime = guessMime(rf.name, "application/pdf");
-    const normalizedResume = await convertOfficeToPdfIfNeeded(
-      rf.buffer,
-      rf.name || "resume",
-      resumeMime
-    );
-    const rUp = await upload(
-      apiKey,
-      normalizedResume.buffer,
-      normalizedResume.filename || "resume.pdf",
-      normalizedResume.mimeType || "application/pdf"
-    );
-    await waitActive(apiKey, rUp.name);
-    parts.push({ file_data: { mime_type: rUp.mimeType, file_uri: rUp.uri } });
-    resumeProvided = true;
+  if (!videoId) {
+    throw new Error(`No video_id returned from 12Labs: ${JSON.stringify(taskResult)}`);
   }
 
-  if (headshotUrl) {
-    const hf = await fetchBinary(headshotUrl, MEDIA_ACCESS_TOKEN);
-    if (hf.size > LIM.h) throw new Error("Headshot too large");
-    const hUp = await upload(apiKey, hf.buffer, hf.name || "headshot.jpg", guessMime(hf.name, "image/jpeg"));
-    await waitActive(apiKey, hUp.name);
-    parts.push({ file_data: { mime_type: hUp.mimeType, file_uri: hUp.uri } });
-    headshotProvided = true;
-  }
+  console.log(`[casting] Video indexed with ID: ${videoId}`);
 
-  const drive = p.drive_folder_link ? normalizeUrl(p.drive_folder_link) : "";
-  const headshotText = headshotUrl || "";
+  // Build prompt
+  const prompt = buildCastingPrompt(p);
 
-  const prompt =
-    "You are an expert casting evaluator. You MUST watch and reason over the ENTIRE audition video from start to finish (all relevant moments), including audio and visuals—not only the opening seconds. " +
-    (resumeProvided
-      ? "Use the resume file for relevant experience, training, credits, and skills.\n\n"
-      : "No resume file was supplied; base experience assessment only on the text fields and video.\n\n") +
-    (headshotProvided
-      ? "A headshot image is included as a separate file; use it only for general presentation reference if helpful.\n\n"
-      : "No headshot image file was supplied.\n\n") +
-    (drive
-      ? "Additional materials may exist at this Drive folder link (you cannot browse it; treat as context only): " + drive + "\n\n"
-      : "") +
-    "VIDEO TYPES (handle all): The submission may be a plain self-introduction, a short skit or monologue, a cold read, an improvisation, a slate, a reel excerpt, or something minimal with little performance. Adapt your criteria accordingly. If the clip contains little or no performative content (e.g., only introduction, reading ID, or a static talking head with no acting task), say so explicitly and score conservatively based on what is actually demonstrated.\n\n" +
-    "WHAT TO ANALYZE (be specific and evidence-based):\n" +
-    "- Performance and presence: energy, pacing, confidence, clarity, believability, connection to camera or scene partner if applicable.\n" +
-    "- Voice and speech: articulation, intelligibility given the recording, tone, emotional coloring when applicable.\n" +
-    "- Face and body: facial expressiveness range (subtle vs broad), micro-expressions, emotional authenticity, eye focus and eye contact, posture, gesture appropriateness, and physical suitability hints for the role only when visible.\n" +
-    "- Facial-expression evidence: cite specific moments when expressions change (for example neutral -> concern -> relief), and clearly state when visibility, framing, or lighting prevents reliable judgment.\n" +
-    "- Fit to THIS role and project: compare against the role description, requirements, characteristics, age and height constraints, location, and casting type.\n\n" +
-    "SCORING AND OUTPUT RULES:\n" +
-    "- ai_score: integer 0-100 for fit and suitability for THIS specific role, using BOTH video and resume (weight the video heavily when it contains real performance; weight the resume more if the video is non-performative).\n" +
-    "- strengths: ONLY positive, specific observations grounded in what you saw, heard, or read. Put facial-expression positives here only when genuinely supported.\n" +
-    "- considerations: concerns, risks, gaps, or weaknesses grounded in what you saw, heard, or read. Put facial-expression limitations here when applicable. Do not duplicate the same point in strengths and considerations.\n" +
-    "- overall_assessment: concise but detailed summary of fit for the role.\n" +
-    "- recommendation: clear next step (for example callback, request more material, or not a fit) with brief rationale.\n\n" +
-    "If something cannot be judged from the footage (for example poor mic, face not visible, clip too short), state that limitation in considerations rather than inventing facts.\n\n" +
-    "- Location fit: Prefer candidates in or near the role location. If far away, consider whether relocation or remote work is realistic based on the project.\n" +
-    "Project Title: " + s(p.PROJECT_TITLE) +
-    "\nProject Overview: " + s(p.project_overview) +
-    "\nCasting for: " + s(p.casting_for) +
-    "\n\nROLE\n" +
-    "Role Type: " + s(p.role_type) +
-    "\nRole Gender: " + s(p.role_gender) +
-    "\nRole Description: " + s(p.role_description) +
-    "\nRole Requirements: " + s(p.role_requirements) +
-    "\nRole Characteristics: " + roleCharsText(p.role_characteristics) +
-    "\nAge Range: " + s(p.age_range) +
-    "\nLocation: " + s(p.location) + " (role)" +
-    "\nMinimum Height: " + s(p.minimum_height) +
-    "\nMaximum Height: " + s(p.maximum_height) +
-    "\nMinimum AI Score: " + s(p.minimum_ai_score) +
-    "\n\nAPPLICANT\n" +
-    "Gender: " + s(p.user_gender) +
-    "\nAge: " + s(p.user_age) +
-    "\nLocation: " + s(p.user_location) + + " (applicant)" +
-    "\nHeight: " + s(p.user_height) +
-    "\nHeadshot URL (text field): " + (headshotText || "(not provided)") +
-    "\nDrive Folder Link: " + (drive || "(not provided)") +
-    "\nAbout: " + s(p.about_person) +
-    "\nBio: " + s(p.bio) +
-    "\n\nReturn ONLY a JSON object with keys: ai_score (integer 0-100), overall_assessment (string), strengths (array of strings), considerations (array of strings), recommendation (string). No markdown, no code fences, no extra text.";
-  console.log("prompt");
-  console.log(prompt);
-  parts.push({ text: prompt });
+  // Query with casting prompt
+  const queryResult = await queryVideoWith12Labs(videoId, prompt);
+  console.log(`[casting] Query result:`, JSON.stringify(queryResult).slice(0, 500));
 
-  const callGenerateContent = async (modelName) => {
-    const genUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-    const genRes = await fetchWithTimeout(
-      genUrl,
-      {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        generationConfig: { responseMimeType: "application/json" },
-      }),
-      },
-      DEFAULT_HTTP_TIMEOUT_MS,
-      `generateContent:${modelName}`
-    );
-
-    const genText = await readWithTimeout(genRes.text(), DEFAULT_HTTP_TIMEOUT_MS, `generateContent:${modelName}:read`);
-    console.log(`[gemini] model=${modelName} status=${genRes.status}`);
-    if (!genRes.ok) {
-      console.error(`[gemini] non-ok response body snippet: ${genText.slice(0, 1000)}`);
-    }
-    let genJson;
-    try {
-      genJson = parseJsonSafe(genText, "generateContent");
-    } catch (e) {
-      logError("gemini-parse-response", e, { modelName, status: genRes.status, bodySnippet: genText.slice(0, 1000) });
-      throw new Error(`generateContent ${genRes.status}: ${e.message || genText.slice(0, 800)}`);
-    }
-    return { genRes, genText, genJson, modelName };
-  };
-
-  const isRetryableModelError = (resp) => {
-    if (!resp || resp.genRes.ok) return false;
-    const status = Number(resp.genRes.status);
-    const message = String(resp.genJson?.error?.message || resp.genText || "").toLowerCase();
-    const isCapacityStatus = status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
-    const isHighDemand =
-      message.includes("currently experiencing high demand") ||
-      message.includes("spikes in demand") ||
-      message.includes("try again later") ||
-      message.includes("resource_exhausted") ||
-      message.includes("rate limit");
-    return isCapacityStatus || isHighDemand;
-  };
-
-  const maxAttemptsPerModel = Math.max(1, Number(process.env.MODEL_MAX_ATTEMPTS || 3));
-  let genAttempt = null;
-  let finalError = null;
-
-  for (let modelIndex = 0; modelIndex < modelPriority.length; modelIndex++) {
-    const modelName = modelPriority[modelIndex];
-    console.log(`[model-selection] trying model=${modelName} order=${modelIndex + 1}/${modelPriority.length}`);
-
-    for (let attempt = 1; attempt <= maxAttemptsPerModel; attempt++) {
-      genAttempt = await callGenerateContent(modelName);
-      if (genAttempt.genRes.ok) break;
-
-      finalError = new Error(genAttempt.genJson?.error?.message || genAttempt.genText || "Model request failed");
-      
-      const shouldRetry = isRetryableModelError(genAttempt) && attempt < maxAttemptsPerModel;
-      if (!shouldRetry) break;
-
-      const baseBackoffMs = Math.min(20000, 1200 * Math.pow(2, attempt - 1));
-      const jitterMs = Math.floor(Math.random() * 500);
-      await sleep(baseBackoffMs + jitterMs);
-    }
-
-    if (genAttempt?.genRes?.ok) break;
-  }
-
-  if (!genAttempt || !genAttempt.genRes.ok) {
-    throw finalError || new Error(genAttempt?.genJson?.error?.message || genAttempt?.genText || "Model request failed");
-  }
-  if (!genAttempt.genJson.candidates?.length) {
-    const br = genAttempt.genJson?.promptFeedback?.blockReason || "";
-    throw new Error(`Gemini returned no candidates. ${br}`);
-  }
-
-  const cand = genAttempt.genJson.candidates[0];
-  const outParts = cand?.content?.parts || [];
-  let outText = "";
-  for (const part of outParts) outText += part.text || "";
-  outText = outText.trim();
-
-  if (!outText) throw new Error(`Empty model text: ${genAttempt.genText.slice(0, 500)}`);
-
+  // Extract and parse the response
   let parsed;
+  const responseText = queryResult.summary || queryResult.text || JSON.stringify(queryResult);
+
   try {
-    parsed = parseJsonSafe(outText, "model-output");
+    parsed = parseJsonSafe(responseText, "12labs-casting-output");
   } catch (e) {
-    throw new Error(`Invalid model JSON: ${e.message || outText.slice(0, 1200)}`);
+    console.error(`[casting] Parse error, creating fallback response`);
+    parsed = {
+      ai_score: 0,
+      overall_assessment: "12Labs analysis could not be fully parsed. Review video manually.",
+      strengths: [],
+      considerations: ["Response parsing incomplete"],
+      recommendation: "hold_for_more_material",
+    };
   }
 
-  const toStrList = (v) => Array.isArray(v) ? v.map((x) => s(x)) : v == null ? [] : [s(v)];
+  // Normalize response
+  const toStrList = (v) => (Array.isArray(v) ? v.map((x) => s(x)) : v == null ? [] : [s(v)]);
   const rawScore = Number(parsed.ai_score);
   const aiScore = Number.isFinite(rawScore) ? Math.round(Math.max(0, Math.min(100, rawScore))) : 0;
 
   return {
-    overall_assessment: s(parsed.overall_assessment),
+    overall_assessment: s(parsed.overall_assessment || ""),
     strengths: toStrList(parsed.strengths),
     considerations: toStrList(parsed.considerations),
-    recommendation: s(parsed.recommendation),
+    recommendation: s(parsed.recommendation || "hold_for_more_material"),
     ai_score: aiScore,
   };
 }
@@ -620,268 +482,66 @@ async function sendBubbleCallback(payload, callbackUrl) {
   const requestedCallbackUrl = cleanOptionalUrl(callbackUrl);
   const configuredDefaultCallbackUrl = cleanOptionalUrl(process.env.BUBBLE_CALLBACK_URL);
   const baseUrl = normalizeUrl(requestedCallbackUrl || configuredDefaultCallbackUrl);
-  if (!baseUrl) throw new Error("Missing callback URL");
-  if (/^https?:\/\/null(?:\/|$)/i.test(baseUrl) || /^https?:\/\/undefined(?:\/|$)/i.test(baseUrl)) {
-    throw new Error(`Invalid callback URL after normalization: ${baseUrl}`);
-  }
-  const callbackCandidates = [];
-  const withoutInitialize = baseUrl.replace(/\/initialize(?:\?.*)?$/i, "");
-  callbackCandidates.push(baseUrl);
-  if (withoutInitialize && withoutInitialize !== baseUrl) callbackCandidates.push(withoutInitialize);
 
-  const maxAttempts = Math.max(1, Number(process.env.CALLBACK_MAX_ATTEMPTS || 4));
+  if (!baseUrl) {
+    console.log("[callback] No callback URL, skipping");
+    return;
+  }
+
+  const maxAttempts = 3;
   let lastErr = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    for (const url of callbackCandidates) {
-      try {
-        console.log(`[callback] attempt=${attempt}/${maxAttempts} url=${url}`);
-        const res = await fetchWithTimeout(
-          url,
-          {
+    try {
+      console.log(`[callback] attempt=${attempt}/${maxAttempts} url=${baseUrl}`);
+      const res = await fetchWithTimeout(
+        baseUrl,
+        {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
-          },
-          DEFAULT_HTTP_TIMEOUT_MS,
-          "bubble-callback"
-        );
+        },
+        30000,
+        "bubble-callback"
+      );
 
-        if (res.ok) {
-          console.log(`[callback] success status=${res.status} url=${url}`);
-          return;
-        }
-
-        const t = await readWithTimeout(res.text(), DEFAULT_HTTP_TIMEOUT_MS, "bubble-callback-read");
-        console.error(`[callback] non-ok status=${res.status} url=${url} body=${t.slice(0, 1000)}`);
-        const retryable =
-          res.status === 408 || res.status === 409 || res.status === 425 || res.status === 429 || res.status >= 500;
-        if (!retryable) {
-          throw new Error(`Callback failed ${res.status}: ${t.slice(0, 800)}`);
-        }
-        lastErr = new Error(`Retryable callback failure ${res.status}: ${t.slice(0, 800)}`);
-      } catch (e) {
-        logError("bubble-callback-attempt", e, { attempt, url });
-        lastErr = e;
+      if (res.ok) {
+        console.log(`[callback] success status=${res.status}`);
+        return;
       }
+
+      const t = await res.text();
+      console.error(`[callback] non-ok status=${res.status} body=${t.slice(0, 500)}`);
+      lastErr = new Error(`Callback failed ${res.status}`);
+    } catch (e) {
+      logError("callback-attempt", e, { attempt });
+      lastErr = e;
     }
 
     if (attempt < maxAttempts) {
-      const backoffMs = Math.min(15000, 1000 * Math.pow(2, attempt - 1));
-      await sleep(backoffMs);
+      await sleep(2000);
     }
   }
 
-  throw new Error(`Bubble callback failed after retries: ${String(lastErr?.message || lastErr)}`);
-}
-
-function normPath(p) {
-  const s = (p || "").replace(/\/$/, "") || "/";
-  return s;
-}
-
-function readBodyBuffer(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
-function decodeBubbleJsonText(text) {
-  return String(text || "")
-    .replace(/\uFEFF/g, "")
-    .replace(/&quot;/g, '"')
-    .replace(/&#34;/g, '"')
-    .replace(/&#x22;/gi, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/gi, "'")
-    .replace(/&amp;/g, "&");
-}
-
-/** Bubble often sends almost-valid JSON; parse POST /jobs here + jsonrepair fallback. */
-async function parseJobsBody(req, res, next) {
-  if (req.method !== "POST" || normPath(req.path) !== "/jobs") return next();
-  try {
-    const buf = await readBodyBuffer(req);
-    const raw = buf.toString("utf8");
-    const normalizedRaw = decodeBubbleJsonText(raw).trim();
-    if (!raw.trim()) {
-      req.body = {};
-      return next();
-    }
-    try {
-      req.body = JSON.parse(normalizedRaw);
-    } catch (e) {
-      try {
-        req.body = JSON.parse(jsonrepair(normalizedRaw));
-      } catch (e2) {
-        const m = String(e.message || "");
-        const posMatch = m.match(/position (\d+)/i);
-        const pos = posMatch ? parseInt(posMatch[1], 10) : 0;
-        return res.status(400).json({
-          error: "Invalid JSON in request body",
-          hint:
-            "In Bubble: API Connector → Body type JSON, and escape any \" inside text fields. Or send one field as Base64. Server also tried automatic repair.",
-          detail: m,
-          snippetAroundError: normalizedRaw.slice(Math.max(0, pos - 60), pos + 60),
-        });
-      }
-    }
-    return next();
-  } catch (err) {
-    return next(err);
+  if (lastErr) {
+    console.error(`[callback] Failed after retries: ${lastErr.message}`);
   }
 }
 
 const app = express();
 app.use(cors());
-app.use(parseJobsBody);
-app.use((req, res, next) => {
-  if (req.method === "POST" && normPath(req.path) === "/jobs") return next();
-  express.json({ limit: "10mb" })(req, res, next);
-});
+app.use(express.json({ limit: "10mb" }));
 
 const jobs = new Map();
-const pendingQueue = [];
 let activeWorkers = 0;
 
-const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS || 2));
-const MAX_QUEUE_SIZE = Math.max(1, Number(process.env.MAX_QUEUE_SIZE || 5000));
-const JOB_TTL_MS = Math.max(60000, Number(process.env.JOB_TTL_MS || 24 * 60 * 60 * 1000));
-
-function queueDepth() {
-  return pendingQueue.length;
-}
-
-function totalOutstandingJobs() {
-  return queueDepth() + activeWorkers;
-}
-
-function buildFallbackCastingResult(err) {
-  const message = s(err?.message || err) || "Model evaluation failed";
-  return {
-    overall_assessment:
-      "We could not complete AI evaluation at this time due to temporary model availability or quota limits. Please retry shortly.",
-    strengths: [],
-    considerations: [
-      "Automated evaluation was unavailable for this attempt.",
-      message,
-    ],
-    recommendation: "Retry evaluation with the same submission after a short delay.",
-    ai_score: 0,
-    error: message,
-    is_fallback: true,
-  };
-}
-
-function pumpQueue() {
-  while (activeWorkers < MAX_CONCURRENT_JOBS && pendingQueue.length > 0) {
-    const item = pendingQueue.shift();
-    if (!item) break;
-    const { jobId, payload } = item;
-    const existing = jobs.get(jobId);
-    if (!existing || existing.status !== "queued") continue;
-
-    activeWorkers += 1;
-    console.log(
-      `[jobs] start id=${jobId} queue_depth=${queueDepth()} active_workers=${activeWorkers} application_id=${payload?.application_id ?? ""}`
-    );
-    jobs.set(jobId, { ...existing, status: "processing", startedAt: new Date().toISOString() });
-
-    (async () => {
-      try {
-        const result = await analyzeCasting(payload);
-        const curr = jobs.get(jobId);
-        if (curr) {
-          jobs.set(jobId, {
-            ...curr,
-            status: "completed",
-            completedAt: new Date().toISOString(),
-            result,
-          });
-        }
-        console.log(`[jobs] completed id=${jobId}`);
-
-        await sendBubbleCallback(
-          {
-            status: "completed",
-            application_id: payload.application_id ?? null,
-            video_link: payload.video_link ?? payload.video_url ?? null,
-            ...result,
-          },
-          payload.callback_url
-        );
-      } catch (err) {
-        logError("job-processing", err, {
-          jobId,
-          application_id: payload?.application_id ?? null,
-          video_link: payload?.video_link ?? payload?.video_url ?? null,
-        });
-        const fallbackResult = buildFallbackCastingResult(err);
-        const curr = jobs.get(jobId);
-        if (curr) {
-          jobs.set(jobId, {
-            ...curr,
-            status: "completed_with_fallback",
-            completedAt: new Date().toISOString(),
-            result: fallbackResult,
-            error: String(err?.message || err),
-          });
-        }
-
-        try {
-          await sendBubbleCallback(
-            {
-              status: "completed_with_fallback",
-              application_id: payload.application_id ?? null,
-              video_link: payload.video_link ?? payload.video_url ?? null,
-              ...fallbackResult,
-            },
-            payload.callback_url
-          );
-        } catch (cbErr) {
-          logError("bubble-callback-final-failure", cbErr, { jobId, callback_url: payload?.callback_url ?? null });
-        }
-      } finally {
-        activeWorkers = Math.max(0, activeWorkers - 1);
-        setImmediate(pumpQueue);
-      }
-    })();
-  }
-}
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, job] of jobs.entries()) {
-    const terminal =
-      job.status === "completed" ||
-      job.status === "failed" ||
-      job.status === "completed_with_fallback";
-    if (!terminal) continue;
-    const doneAt = new Date(job.completedAt || job.createdAt || now).getTime();
-    if (now - doneAt > JOB_TTL_MS) jobs.delete(id);
-  }
-}, 5 * 60 * 1000);
-
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "casting-render-service" });
+  res.json({ ok: true, service: "casting-render-service-twelvelabs" });
 });
 
 app.post("/jobs", (req, res) => {
-  if (queueDepth() >= MAX_QUEUE_SIZE) {
-    return res.status(429).json({
-      error: "Queue is full",
-      hint: "Please retry shortly.",
-    });
-  }
-
   const jobId = uuidv4();
   const payload = req.body || {};
-  payload.video_link = payload.video_link || payload.video_url || "";
-  payload.video_url = payload.video_url || payload.video_link || "";
 
   jobs.set(jobId, {
     id: jobId,
@@ -891,9 +551,79 @@ app.post("/jobs", (req, res) => {
     error: null,
   });
 
-  pendingQueue.push({ jobId, payload });
-  res.status(200).json({ ok: true, status: "accepted" });
-  setImmediate(pumpQueue);
+  res.status(200).json({ ok: true, status: "accepted", jobId });
+
+  // Process async
+  (async () => {
+    try {
+      activeWorkers += 1;
+      console.log(`[jobs] start id=${jobId} application_id=${payload?.application_id ?? ""}`);
+      jobs.set(jobId, { ...jobs.get(jobId), status: "processing", startedAt: new Date().toISOString() });
+
+      const result = await analyzeCastingWith12Labs(payload);
+      const curr = jobs.get(jobId);
+
+      if (curr) {
+        jobs.set(jobId, {
+          ...curr,
+          status: "completed",
+          completedAt: new Date().toISOString(),
+          result,
+        });
+      }
+
+      console.log(`[jobs] completed id=${jobId} score=${result.ai_score}`);
+
+      await sendBubbleCallback(
+        {
+          status: "completed",
+          application_id: payload.application_id ?? null,
+          video_link: payload.video_link ?? payload.video_url ?? null,
+          ...result,
+        },
+        payload.callback_url
+      );
+    } catch (err) {
+      logError("job-processing", err, { jobId, application_id: payload?.application_id });
+
+      const fallbackResult = {
+        overall_assessment: "12Labs evaluation could not be completed. Please retry.",
+        strengths: [],
+        considerations: ["Service temporarily unavailable"],
+        recommendation: "hold_for_more_material",
+        ai_score: 0,
+        error: String(err?.message || err),
+        is_fallback: true,
+      };
+
+      const curr = jobs.get(jobId);
+      if (curr) {
+        jobs.set(jobId, {
+          ...curr,
+          status: "completed_with_fallback",
+          completedAt: new Date().toISOString(),
+          result: fallbackResult,
+          error: String(err?.message || err),
+        });
+      }
+
+      try {
+        await sendBubbleCallback(
+          {
+            status: "completed_with_fallback",
+            application_id: payload.application_id ?? null,
+            video_link: payload.video_link ?? payload.video_url ?? null,
+            ...fallbackResult,
+          },
+          payload.callback_url
+        );
+      } catch (cbErr) {
+        logError("callback-failure", cbErr, { jobId });
+      }
+    } finally {
+      activeWorkers = Math.max(0, activeWorkers - 1);
+    }
+  })();
 });
 
 app.get("/jobs/:id", (req, res) => {
@@ -905,27 +635,13 @@ app.get("/jobs/:id", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
-    queue_depth: queueDepth(),
+    service: "casting-render-service-twelvelabs",
     active_workers: activeWorkers,
-    max_concurrent_jobs: MAX_CONCURRENT_JOBS,
-    max_queue_size: MAX_QUEUE_SIZE,
-    total_outstanding: totalOutstandingJobs(),
     jobs_tracked: jobs.size,
   });
 });
 
-app.use((err, req, res, next) => {
-  if (err instanceof SyntaxError && /json|parse/i.test(String(err.message))) {
-    return res.status(400).json({
-      error: "Invalid JSON in request body",
-      hint: "Send Content-Type: application/json. Escape inner double-quotes in strings. If a field contains raw newlines, JSON-escape them.",
-      detail: err.message,
-    });
-  }
-  next(err);
-});
-
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT_12LABS || 10001;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`[12Labs] Server running on port ${PORT}`);
 });
